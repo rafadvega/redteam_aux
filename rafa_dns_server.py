@@ -77,138 +77,195 @@ class SimpleDNSServer:
         """Extrae el nombre del dominio de la consulta DNS"""
         domain_parts = []
         i = offset
+        original_offset = offset
         
         while i < len(data) and data[i] != 0:
             length = data[i]
+            
+            # Verificar si es un puntero (compresión DNS)
+            if (length & 0xC0) == 0xC0:
+                if i + 1 < len(data):
+                    pointer = ((length & 0x3F) << 8) | data[i + 1]
+                    # Recursivamente parsear desde el puntero
+                    pointed_domain, _ = self.parse_domain_name(data, pointer)
+                    if pointed_domain:
+                        domain_parts.append(pointed_domain)
+                    return '.'.join(domain_parts), i + 2
+                else:
+                    break
+            
             i += 1
             if i + length <= len(data):
-                domain_parts.append(data[i:i+length].decode('utf-8'))
-                i += length
+                try:
+                    domain_parts.append(data[i:i+length].decode('utf-8'))
+                    i += length
+                except UnicodeDecodeError:
+                    # Si hay error de decodificación, salir
+                    break
             else:
                 break
         
-        return '.'.join(domain_parts), i + 1
+        return '.'.join(domain_parts), i + 1 if i < len(data) else len(data)
     
     def encode_domain_name(self, domain):
         """Codifica un nombre de dominio en formato DNS"""
+        if not domain or domain == '.':
+            return b'\x00'
+        
         encoded = b''
         for part in domain.split('.'):
-            encoded += struct.pack('!B', len(part))
-            encoded += part.encode('utf-8')
+            if part:  # Evitar partes vacías
+                part_bytes = part.encode('utf-8')
+                if len(part_bytes) > 63:  # Límite DNS
+                    part_bytes = part_bytes[:63]
+                encoded += struct.pack('!B', len(part_bytes))
+                encoded += part_bytes
         encoded += struct.pack('!B', 0)  # Fin del nombre
         return encoded
     
-    def build_response(self, query_data, domain, query_type):
+    def build_response(self, query_data, domain, query_type, query_class):
         """Construye la respuesta DNS"""
-        # Copiar el header original y modificar flags
-        response = bytearray(query_data[:2])  # Transaction ID
-        response.extend(struct.pack('!H', 0x8180))  # Flags: respuesta estándar
-        response.extend(query_data[4:12])  # Questions, Answers, Authority, Additional
+        if len(query_data) < 12:
+            raise ValueError("Query demasiado corta")
         
-        # Cambiar número de respuestas a 1
-        response[6:8] = struct.pack('!H', 1)
+        # Header de respuesta
+        transaction_id = query_data[0:2]
         
-        # Copiar la sección de pregunta completa
-        i = 12
-        while i < len(query_data) and query_data[i] != 0:
-            i += 1
-        i += 5  # Saltar el 0 final + tipo + clase
+        # Flags de respuesta más completos
+        # QR=1 (respuesta), Opcode=0 (query estándar), AA=1 (autoritativo), 
+        # TC=0 (no truncado), RD=1 (recursión deseada), RA=1 (recursión disponible),
+        # Z=0 (reservado), RCODE=0 (sin error)
+        flags = 0x8580  # 1000 0101 1000 0000
         
-        response.extend(query_data[12:i])
+        # Construir header completo
+        response = bytearray()
+        response.extend(transaction_id)                    # Transaction ID
+        response.extend(struct.pack('!H', flags))          # Flags
+        response.extend(struct.pack('!H', 1))              # Questions = 1
+        response.extend(struct.pack('!H', 1))              # Answers = 1
+        response.extend(struct.pack('!H', 0))              # Authority RRs = 0
+        response.extend(struct.pack('!H', 0))              # Additional RRs = 0
         
-        # Agregar la respuesta
-        response.extend(struct.pack('!H', 0xC00C))  # Puntero al nombre
-        response.extend(struct.pack('!H', query_type))  # Tipo de consulta
-        response.extend(struct.pack('!H', 1))       # Clase IN
-        response.extend(struct.pack('!I', 300))     # TTL
+        # Sección de pregunta (copiar desde query original)
+        question_start = 12
+        domain_name, question_end = self.parse_domain_name(query_data, question_start)
+        
+        # Verificar que tenemos suficientes datos para tipo y clase
+        if question_end + 4 > len(query_data):
+            raise ValueError("Query malformada: faltan datos de tipo/clase")
+        
+        # Copiar la pregunta completa desde el query original
+        question_section = query_data[question_start:question_end + 4]
+        response.extend(question_section)
+        
+        # Sección de respuesta
+        # Usar compresión DNS apuntando al nombre en la pregunta
+        response.extend(struct.pack('!H', 0xC00C))         # Puntero al nombre (offset 12)
+        response.extend(struct.pack('!H', query_type))     # Tipo
+        response.extend(struct.pack('!H', query_class))    # Clase
+        response.extend(struct.pack('!I', 300))            # TTL
         
         # Datos de respuesta según el tipo
         response_value = ""
         
         if query_type == 1:  # A record (IPv4)
-            response.extend(struct.pack('!H', 4))  # Longitud
-            for part in self.default_ip.split('.'):
-                response.extend(struct.pack('!B', int(part)))
+            ip_parts = self.default_ip.split('.')
+            if len(ip_parts) != 4:
+                raise ValueError("IP inválida")
+            
+            ip_bytes = b''.join(struct.pack('!B', int(part)) for part in ip_parts)
+            response.extend(struct.pack('!H', 4))          # Longitud de datos
+            response.extend(ip_bytes)
             response_value = self.default_ip
         
         elif query_type == 28:  # AAAA record (IPv6)
-            response.extend(struct.pack('!H', 16))  # Longitud
-            # Convertir ::1 a bytes
-            response.extend(b'\x00' * 15 + b'\x01')
+            # Convertir ::1 a 16 bytes
+            ipv6_bytes = b'\x00' * 15 + b'\x01'
+            response.extend(struct.pack('!H', 16))         # Longitud de datos
+            response.extend(ipv6_bytes)
             response_value = self.default_ipv6
         
-        elif query_type == 15:  # MX record (Mail Exchange)
-            mx_domain = f"mail.{domain}"
+        elif query_type == 15:  # MX record
+            mx_domain = f"mail.{domain}" if domain else "mail.localhost"
             mx_encoded = self.encode_domain_name(mx_domain)
-            response.extend(struct.pack('!H', 2 + len(mx_encoded)))  # Longitud
-            response.extend(struct.pack('!H', 10))  # Prioridad
-            response.extend(mx_encoded)
+            mx_data = struct.pack('!H', 10) + mx_encoded   # Prioridad + dominio
+            response.extend(struct.pack('!H', len(mx_data)))
+            response.extend(mx_data)
             response_value = f"10 {mx_domain}"
         
-        elif query_type == 5:  # CNAME record (Canonical Name)
-            cname_target = f"canonical.{domain}"
+        elif query_type == 5:  # CNAME record
+            cname_target = f"canonical.{domain}" if domain else "canonical.localhost"
             cname_encoded = self.encode_domain_name(cname_target)
             response.extend(struct.pack('!H', len(cname_encoded)))
             response.extend(cname_encoded)
             response_value = cname_target
         
         elif query_type == 16:  # TXT record
-            txt_data = f"v=spf1 a mx include:_spf.{domain} ~all"
+            txt_data = f"v=spf1 a mx include:_spf.{domain} ~all" if domain else "v=spf1 a mx ~all"
             txt_bytes = txt_data.encode('utf-8')
-            response.extend(struct.pack('!H', len(txt_bytes) + 1))
-            response.extend(struct.pack('!B', len(txt_bytes)))
-            response.extend(txt_bytes)
+            # TXT records necesitan longitud de string antes del contenido
+            txt_record = struct.pack('!B', len(txt_bytes)) + txt_bytes
+            response.extend(struct.pack('!H', len(txt_record)))
+            response.extend(txt_record)
             response_value = f'"{txt_data}"'
         
-        elif query_type == 2:  # NS record (Name Server)
-            ns_domain = f"ns1.{domain}"
+        elif query_type == 2:  # NS record
+            ns_domain = f"ns1.{domain}" if domain else "ns1.localhost"
             ns_encoded = self.encode_domain_name(ns_domain)
             response.extend(struct.pack('!H', len(ns_encoded)))
             response.extend(ns_encoded)
             response_value = ns_domain
         
-        elif query_type == 6:  # SOA record (Start of Authority)
-            primary_ns = f"ns1.{domain}"
-            admin_email = f"admin.{domain}"
-            
-            primary_encoded = self.encode_domain_name(primary_ns)
-            admin_encoded = self.encode_domain_name(admin_email)
-            
-            soa_data = primary_encoded + admin_encoded
-            soa_data += struct.pack('!I', 2024011501)  # Serial
-            soa_data += struct.pack('!I', 3600)       # Refresh
-            soa_data += struct.pack('!I', 1800)       # Retry
-            soa_data += struct.pack('!I', 604800)     # Expire
-            soa_data += struct.pack('!I', 86400)      # Minimum TTL
-            
-            response.extend(struct.pack('!H', len(soa_data)))
-            response.extend(soa_data)
-            response_value = f"{primary_ns} {admin_email} 2024011501 3600 1800 604800 86400"
-        
-        elif query_type == 12:  # PTR record (Pointer)
-            ptr_target = f"host.{domain}"
+        elif query_type == 12:  # PTR record
+            ptr_target = f"host.{domain}" if domain else "host.localhost"
             ptr_encoded = self.encode_domain_name(ptr_target)
             response.extend(struct.pack('!H', len(ptr_encoded)))
             response.extend(ptr_encoded)
             response_value = ptr_target
         
-        else:  # Tipos desconocidos - responder como A record
-            response.extend(struct.pack('!H', 4))
-            for part in self.default_ip.split('.'):
-                response.extend(struct.pack('!B', int(part)))
-            response_value = f"{self.default_ip} (fallback A record)"
+        else:  # Tipo no soportado - devolver NXDOMAIN
+            # Cambiar RCODE a 3 (NXDOMAIN)
+            flags_nxdomain = 0x8583
+            response[2:4] = struct.pack('!H', flags_nxdomain)
+            response[6:8] = struct.pack('!H', 0)  # Answers = 0
+            response_value = "NXDOMAIN"
+            return bytes(response), response_value
         
         return bytes(response), response_value
     
     def handle_query(self, data, addr, sock):
         """Maneja una consulta DNS"""
         try:
-            # Extraer información básica
+            # Validaciones básicas
+            if len(data) < 12:
+                raise ValueError("Paquete DNS demasiado corto")
+            
+            # Extraer información del header
             transaction_id = struct.unpack('!H', data[0:2])[0]
+            flags = struct.unpack('!H', data[2:4])[0]
+            
+            # Verificar que es una query (QR bit = 0)
+            if flags & 0x8000:
+                raise ValueError("Recibida respuesta en lugar de query")
+            
+            # Extraer contadores
+            qdcount = struct.unpack('!H', data[4:6])[0]
+            
+            if qdcount != 1:
+                raise ValueError(f"Solo se soporta 1 pregunta, recibidas: {qdcount}")
             
             # Extraer dominio y tipo de consulta
             domain, end_pos = self.parse_domain_name(data, 12)
+            
+            if end_pos + 4 > len(data):
+                raise ValueError("Query malformada")
+            
             query_type = struct.unpack('!H', data[end_pos:end_pos+2])[0]
+            query_class = struct.unpack('!H', data[end_pos+2:end_pos+4])[0]
+            
+            # Solo soportar clase IN (Internet)
+            if query_class != 1:
+                raise ValueError(f"Clase no soportada: {query_class}")
             
             # Mapeo de tipos de consulta para logging
             query_types = {
@@ -217,7 +274,7 @@ class SimpleDNSServer:
             }
             type_name = query_types.get(query_type, f'TYPE{query_type}')
             
-            # *** LOGGING DE CONSULTAS EN JSON ***
+            # Log de consulta
             self.log_event({
                 "event_type": "query",
                 "client_ip": addr[0],
@@ -225,15 +282,16 @@ class SimpleDNSServer:
                 "domain": domain,
                 "query_type": type_name,
                 "query_type_code": query_type,
+                "query_class": query_class,
                 "transaction_id": transaction_id,
                 "query_size": len(data)
             })
             
             # Construir y enviar respuesta
-            response, response_value = self.build_response(data, domain, query_type)
+            response, response_value = self.build_response(data, domain, query_type, query_class)
             sock.sendto(response, addr)
             
-            # Log de la respuesta
+            # Log de respuesta
             self.log_event({
                 "event_type": "response",
                 "client_ip": addr[0],
@@ -247,17 +305,30 @@ class SimpleDNSServer:
             })
                 
         except Exception as e:
+            # Log de error
             self.log_event({
                 "event_type": "error",
                 "client_ip": addr[0] if addr else "unknown",
                 "client_port": addr[1] if addr else 0,
                 "error": str(e),
-                "error_type": type(e).__name__
+                "error_type": type(e).__name__,
+                "query_size": len(data) if data else 0
             })
+            
+            # Intentar enviar respuesta de error si es posible
+            try:
+                if len(data) >= 12:
+                    error_response = bytearray(data[:2])  # Transaction ID
+                    error_response.extend(struct.pack('!H', 0x8182))  # SERVFAIL
+                    error_response.extend(data[4:12])  # Contadores originales
+                    sock.sendto(bytes(error_response), addr)
+            except:
+                pass  # Si no se puede enviar error, ignorar
     
     def start(self):
         """Inicia el servidor DNS"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((self.host, self.port))
         
         print(f"🚀 Servidor DNS simple iniciado en {self.host}:{self.port}")
@@ -268,7 +339,6 @@ class SimpleDNSServer:
         print(f"   CNAME -> canonical.[domain]")
         print(f"   TXT   -> SPF record")
         print(f"   NS    -> ns1.[domain]")
-        print(f"   SOA   -> Registro completo SOA")
         print(f"   PTR   -> host.[domain]")
         print(f"📝 Archivo de log JSON: {self.log_file}")
         print("=" * 60)
