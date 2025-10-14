@@ -123,19 +123,102 @@ class SimpleDNSServer:
         encoded += struct.pack('!B', 0)  # Fin del nombre
         return encoded
     
-    def build_response(self, query_data, domain, query_type, query_class):
-        """Construye la respuesta DNS"""
+    def parse_query_sections(self, data):
+        """Parsea todas las secciones de la query incluyendo EDNS0"""
+        if len(data) < 12:
+            raise ValueError("Query demasiado corta")
+        
+        # Header
+        header = struct.unpack('!HHHHHH', data[:12])
+        transaction_id, flags, qdcount, ancount, nscount, arcount = header
+        
+        offset = 12
+        questions = []
+        additional = []
+        
+        # Parsear preguntas
+        for _ in range(qdcount):
+            domain, new_offset = self.parse_domain_name(data, offset)
+            if new_offset + 4 > len(data):
+                raise ValueError("Query malformada en sección de preguntas")
+            
+            qtype = struct.unpack('!H', data[new_offset:new_offset+2])[0]
+            qclass = struct.unpack('!H', data[new_offset+2:new_offset+4])[0]
+            
+            questions.append({
+                'domain': domain,
+                'type': qtype,
+                'class': qclass
+            })
+            offset = new_offset + 4
+        
+        # Saltar secciones de respuesta y autoridad si existen
+        for _ in range(ancount + nscount):
+            if offset >= len(data):
+                break
+            # Parsear nombre
+            _, offset = self.parse_domain_name(data, offset)
+            if offset + 10 > len(data):
+                break
+            # Saltar tipo, clase, TTL
+            offset += 8
+            # Obtener longitud de datos y saltarlos
+            rdlength = struct.unpack('!H', data[offset:offset+2])[0]
+            offset += 2 + rdlength
+        
+        # Parsear sección adicional (para detectar EDNS0)
+        edns0_detected = False
+        for _ in range(arcount):
+            if offset >= len(data):
+                break
+            
+            name_start = offset
+            domain, offset = self.parse_domain_name(data, offset)
+            
+            if offset + 10 > len(data):
+                break
+                
+            rtype = struct.unpack('!H', data[offset:offset+2])[0]
+            rclass = struct.unpack('!H', data[offset+2:offset+4])[0]
+            ttl = struct.unpack('!I', data[offset+4:offset+8])[0]
+            rdlength = struct.unpack('!H', data[offset+8:offset+10])[0]
+            
+            # Detectar EDNS0 (tipo 41)
+            if rtype == 41:
+                edns0_detected = True
+                additional.append({
+                    'type': 'EDNS0',
+                    'udp_size': rclass,  # En EDNS0, class field es UDP payload size
+                    'extended_rcode': (ttl >> 24) & 0xFF,
+                    'version': (ttl >> 16) & 0xFF,
+                    'flags': ttl & 0xFFFF
+                })
+            
+            offset += 10 + rdlength
+        
+        return {
+            'header': header,
+            'questions': questions,
+            'additional': additional,
+            'edns0_detected': edns0_detected
+        }
+    
+    def build_response(self, query_data, domain, query_type, query_class, query_flags, edns0_info=None):
+        """Construye la respuesta DNS mejorada"""
         if len(query_data) < 12:
             raise ValueError("Query demasiado corta")
         
         # Header de respuesta
         transaction_id = query_data[0:2]
         
-        # Flags de respuesta más completos
-        # QR=1 (respuesta), Opcode=0 (query estándar), AA=1 (autoritativo), 
-        # TC=0 (no truncado), RD=1 (recursión deseada), RA=1 (recursión disponible),
-        # Z=0 (reservado), RCODE=0 (sin error)
-        flags = 0x8580  # 1000 0101 1000 0000
+        # Flags de respuesta mejorados
+        # Preservar RD bit de la query original
+        original_flags = struct.unpack('!H', query_data[2:4])[0]
+        rd_bit = original_flags & 0x0100  # Recursion Desired
+        
+        # QR=1 (respuesta), Opcode=0, AA=0 (no autoritativo para ser más compatible),
+        # TC=0, RD=preservado, RA=1, Z=0, RCODE=0
+        flags = 0x8000 | rd_bit | 0x0080  # QR=1, RA=1, preservar RD
         
         # Construir header completo
         response = bytearray()
@@ -144,7 +227,10 @@ class SimpleDNSServer:
         response.extend(struct.pack('!H', 1))              # Questions = 1
         response.extend(struct.pack('!H', 1))              # Answers = 1
         response.extend(struct.pack('!H', 0))              # Authority RRs = 0
-        response.extend(struct.pack('!H', 0))              # Additional RRs = 0
+        
+        # Additional RRs (1 si hay EDNS0, 0 si no)
+        additional_count = 1 if edns0_info else 0
+        response.extend(struct.pack('!H', additional_count))
         
         # Sección de pregunta (copiar desde query original)
         question_start = 12
@@ -163,7 +249,7 @@ class SimpleDNSServer:
         response.extend(struct.pack('!H', 0xC00C))         # Puntero al nombre (offset 12)
         response.extend(struct.pack('!H', query_type))     # Tipo
         response.extend(struct.pack('!H', query_class))    # Clase
-        response.extend(struct.pack('!I', 300))            # TTL
+        response.extend(struct.pack('!I', 300))            # TTL más conservador
         
         # Datos de respuesta según el tipo
         response_value = ""
@@ -225,43 +311,37 @@ class SimpleDNSServer:
         
         else:  # Tipo no soportado - devolver NXDOMAIN
             # Cambiar RCODE a 3 (NXDOMAIN)
-            flags_nxdomain = 0x8583
+            flags_nxdomain = flags | 0x0003
             response[2:4] = struct.pack('!H', flags_nxdomain)
             response[6:8] = struct.pack('!H', 0)  # Answers = 0
+            response[10:12] = struct.pack('!H', 0)  # Additional = 0
             response_value = "NXDOMAIN"
             return bytes(response), response_value
+        
+        # Agregar sección EDNS0 si fue detectada en la query
+        if edns0_info:
+            response.extend(b'\x00')                       # Root domain (.)
+            response.extend(struct.pack('!H', 41))         # Type OPT (EDNS0)
+            response.extend(struct.pack('!H', 4096))       # UDP payload size
+            response.extend(struct.pack('!I', 0))          # Extended RCODE, Version, Flags
+            response.extend(struct.pack('!H', 0))          # RDLEN = 0 (no options)
         
         return bytes(response), response_value
     
     def handle_query(self, data, addr, sock):
-        """Maneja una consulta DNS"""
+        """Maneja una consulta DNS con mejor compatibilidad"""
         try:
-            # Validaciones básicas
-            if len(data) < 12:
-                raise ValueError("Paquete DNS demasiado corto")
+            # Parsear query completa
+            query_info = self.parse_query_sections(data)
             
-            # Extraer información del header
-            transaction_id = struct.unpack('!H', data[0:2])[0]
-            flags = struct.unpack('!H', data[2:4])[0]
+            if not query_info['questions']:
+                raise ValueError("No hay preguntas en la query")
             
-            # Verificar que es una query (QR bit = 0)
-            if flags & 0x8000:
-                raise ValueError("Recibida respuesta en lugar de query")
-            
-            # Extraer contadores
-            qdcount = struct.unpack('!H', data[4:6])[0]
-            
-            if qdcount != 1:
-                raise ValueError(f"Solo se soporta 1 pregunta, recibidas: {qdcount}")
-            
-            # Extraer dominio y tipo de consulta
-            domain, end_pos = self.parse_domain_name(data, 12)
-            
-            if end_pos + 4 > len(data):
-                raise ValueError("Query malformada")
-            
-            query_type = struct.unpack('!H', data[end_pos:end_pos+2])[0]
-            query_class = struct.unpack('!H', data[end_pos+2:end_pos+4])[0]
+            # Tomar la primera pregunta
+            question = query_info['questions'][0]
+            domain = question['domain']
+            query_type = question['type']
+            query_class = question['class']
             
             # Solo soportar clase IN (Internet)
             if query_class != 1:
@@ -274,8 +354,8 @@ class SimpleDNSServer:
             }
             type_name = query_types.get(query_type, f'TYPE{query_type}')
             
-            # Log de consulta
-            self.log_event({
+            # Log de consulta con información EDNS0
+            log_data = {
                 "event_type": "query",
                 "client_ip": addr[0],
                 "client_port": addr[1],
@@ -283,12 +363,24 @@ class SimpleDNSServer:
                 "query_type": type_name,
                 "query_type_code": query_type,
                 "query_class": query_class,
-                "transaction_id": transaction_id,
-                "query_size": len(data)
-            })
+                "transaction_id": query_info['header'][0],
+                "query_size": len(data),
+                "edns0_detected": query_info['edns0_detected']
+            }
+            
+            if query_info['edns0_detected']:
+                log_data["edns0_info"] = query_info['additional']
+            
+            self.log_event(log_data)
             
             # Construir y enviar respuesta
-            response, response_value = self.build_response(data, domain, query_type, query_class)
+            original_flags = query_info['header'][1]
+            edns0_info = query_info['additional'][0] if query_info['edns0_detected'] else None
+            
+            response, response_value = self.build_response(
+                data, domain, query_type, query_class, original_flags, edns0_info
+            )
+            
             sock.sendto(response, addr)
             
             # Log de respuesta
@@ -301,7 +393,8 @@ class SimpleDNSServer:
                 "query_type_code": query_type,
                 "response_value": response_value,
                 "response_size": len(response),
-                "ttl": 300
+                "ttl": 300,
+                "edns0_included": edns0_info is not None
             })
                 
         except Exception as e:
@@ -319,7 +412,11 @@ class SimpleDNSServer:
             try:
                 if len(data) >= 12:
                     error_response = bytearray(data[:2])  # Transaction ID
-                    error_response.extend(struct.pack('!H', 0x8182))  # SERVFAIL
+                    # SERVFAIL con flags más compatibles
+                    original_flags = struct.unpack('!H', data[2:4])[0]
+                    rd_bit = original_flags & 0x0100
+                    error_flags = 0x8000 | rd_bit | 0x0080 | 0x0002  # QR=1, RA=1, RCODE=SERVFAIL
+                    error_response.extend(struct.pack('!H', error_flags))
                     error_response.extend(data[4:12])  # Contadores originales
                     sock.sendto(bytes(error_response), addr)
             except:
@@ -329,6 +426,11 @@ class SimpleDNSServer:
         """Inicia el servidor DNS"""
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        
+        # Aumentar buffer para EDNS0
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 65536)
+        
         sock.bind((self.host, self.port))
         
         print(f"🚀 Servidor DNS simple iniciado en {self.host}:{self.port}")
@@ -340,12 +442,17 @@ class SimpleDNSServer:
         print(f"   TXT   -> SPF record")
         print(f"   NS    -> ns1.[domain]")
         print(f"   PTR   -> host.[domain]")
+        print(f"🔧 Características:")
+        print(f"   ✅ Soporte EDNS0")
+        print(f"   ✅ Flags compatibles con OpenDNS")
+        print(f"   ✅ Manejo mejorado de errores")
         print(f"📝 Archivo de log JSON: {self.log_file}")
         print("=" * 60)
         
         try:
             while True:
-                data, addr = sock.recvfrom(512)
+                # Aumentar tamaño de buffer para EDNS0
+                data, addr = sock.recvfrom(4096)
                 self.handle_query(data, addr, sock)
                 
         except KeyboardInterrupt:
